@@ -23,12 +23,12 @@ from langgraph.checkpoint.memory import MemorySaver
 
 # ── 프롬프트 ───────────────────────
 PLAN_PROMPT = (
-    "You are an expert writer. "
-    "Write a high-level outline for an essay on the given topic. "
+    "You are an expert writer. 한국어로 관련 주제에 대해 글을 써라. "
+    "Write a high-level outline for an fiction on the given topic. "
     "Include relevant notes or instructions for each section."
 )
 
-WRITER_PROMPT = """You are an essay assistant writing excellent 5-paragraph essays.
+WRITER_PROMPT = """You are an writing assistant writing excellent short SF fiction.
 Generate the best essay possible for the user's request and the initial outline.
 If the user provides critique, respond with a revised version of your previous attempt.
 Use the following reference content as needed:
@@ -169,6 +169,7 @@ if __name__ == '__main__':
     graph = build_graph()
     #pip install grandalf
     #print(graph.get_graph().print_ascii())
+    #print(graph.get_graph().draw_mermaid_png(output_file_path="./team_agent_graph.png"))
 
     task = input('어떤 주제에 대해 글을 쓸까요? \n')
     thread_id = {'configurable' : {'thread_id':'essay-1'}}
