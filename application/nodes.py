@@ -5,6 +5,9 @@ from zoneinfo import ZoneInfo #타임존(태평양시... 미국 기준시... etc
 import config
 import requests
 
+import json 
+import traceback
+
 #랭그래프 내부에서 답변을 주는 chatgpt를 분리해서 사용 -> json포맷을 지키는 gpt
 from langchain_openai import ChatOpenAI
 llm_json = ChatOpenAI(
@@ -18,8 +21,14 @@ llm_normal = ChatOpenAI(
     temperature = 0.7,
 )
 
-def _call_tool():
-    pass
+def _call_tool(name: str, fn, **data) :
+    """외부 API 호출을 감싸서 텔레메트리에 기록. 실패하면 None 반환."""
+    try:
+        result = fn()
+        return result
+    except Exception as e:
+        print(f"[{name}] 오류: {e}")
+        return None
 
 #각 함수들이 gpt에 말을 걸 때 사용가능한 기본 함수(랭그래프X, 기능적필요O) 작성
 def _call_llm(llm, messages, max_attempts=3):
@@ -107,6 +116,23 @@ def classify_intent(state : dict):
 
     return {**state, 'intent':'unknown'}
 
+def _geocode(location: str):
+    """지역명 -> (위도, 경도). 실패하면 예외를 던짐 (_call_tool이 잡아서 None으로 변환)."""
+    url = "http://api.openweathermap.org/geo/1.0/direct"
+    params = {"q": f"{location},KR", "limit": 1, "appid": config.WEATHER_API_KEY}
+    res = requests.get(url, params=params, timeout=5)
+    res.raise_for_status()
+    results = res.json()
+    if not results:
+        raise ValueError(f"'{location}'에 대한 지오코딩 결과 없음")
+    return results[0]["lat"], results[0]["lon"]
+
+def _fetch_weather_by_coords(lat: float, lon: float) -> str:
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    params = {"lat": lat, "lon": lon, "appid": config.WEATHER_API_KEY, "lang": "kr", "units": "metric"}
+    response = requests.get(url, params=params, timeout=5)
+    response.raise_for_status()
+    return response.json()["weather"][0]["main"]
 
 
 def get_time_slot(state: dict) -> dict:
@@ -137,15 +163,119 @@ def get_season(state: dict) -> dict:
 
 def get_weather(state:dict):
     print('get_weather....')
+    location = state.get("location", "서울")
+
+    coords = _call_tool("geocode", lambda: _geocode(location), location=location)
+    if coords is None:
+        print(f"[get_weather] '{location}' 좌표를 찾지 못해 서울 좌표로 대체")
+        coords = (37.5665, 126.9780) #서울의 위도 경도
+    lat, lon = coords
+
+    weather = _call_tool("weather_api", lambda: _fetch_weather_by_coords(lat, lon), lat=lat, lon=lon)
+    if weather is None:
+        weather = "Clear"
+
+    return {**state, "weather": weather, "coords": {"lat": lat, "lon": lon}}
 
 def recommend_food(state:dict):
     print('recommend_food')
+    user_input = state.get("user_input", "")
+    season = state.get("season", "봄")
+    weather = state.get("weather", "Clear")
+    timeslot = state.get("timeslot", "오후")
+
+    prompt = f"""당신은 음식 추천 AI입니다.
+    사용자 입력: "{user_input}"
+    현재 조건:
+    - 계절: {season}
+    - 날씨: {weather}
+    - 시간대: {timeslot}
+
+    이 조건에 어울리는 음식 2가지를 추천해 주세요.
+
+    사용자가 특정 음식을 언급한 경우(예: "피자")에는 그 음식을 포함하거나,
+    관련된 음식 또는 어울리는 음식으로 추천해도 좋습니다.
+
+    결과는 반드시 JSON 배열 형식으로 출력하세요.
+    예: ["피자", "떡볶이"]
+    """
+
+    response = _call_llm(llm_json, [{"role": "user", "content": prompt}])
+    items = ["추천 실패"]
+    if response is not None:
+        try:
+            items = _flatten(json.loads(response.content))
+        except Exception:
+            print("[recommend_food] 파싱 실패:")
+            print(traceback.format_exc())
+
+    return {**state, "recommend_items": items}
 
 def recommend_activity(state:dict):
     print('recommend_activity')
+    user_input = state.get("user_input", "")
+    season = state.get("season", "봄")
+    weather = state.get("weather", "Clear")
+    timeslot = state.get("timeslot", "오후")
+
+    prompt = f"""당신은 활동 추천 AI입니다.
+
+    사용자 입력: "{user_input}"
+    현재 조건:
+    - 계절: {season}
+    - 날씨: {weather}
+    - 시간대: {timeslot}
+
+    이 조건과 입력에 어울리는 활동 2가지를 추천해 주세요.
+    실내 활동이 포함되면 더 좋습니다.
+
+    결과는 반드시 JSON 배열 형식으로 출력하세요.
+    예: ["북카페 가기", "실내 보드게임"]
+    """
+
+    response = _call_llm(llm_json, [{"role": "user", "content": prompt}])
+    items = ["추천 실패"]
+    if response is not None:
+        try:
+            items = _flatten(json.loads(response.content))
+        except Exception:
+            print("[recommend_activity] 파싱 실패:")
+            print(traceback.format_exc())
+
+    return {**state, "recommend_items": items}
 
 def generate_search_keyword(state:dict):
     print('search keyword...')
+    """추천받은 항목(예: '김치찌개') -> 장소 검색용 키워드(예: '한식')로 변환."""
+    items = _flatten(state.get("recommend_items", ["추천"]))
+    item = items[0]
+
+    user_input = state.get("user_input", "")
+    intent = state.get("intent", "food")
+
+    prompt = f"""사용자의 입력: "{user_input}"
+    추천 항목: "{item}"
+    의도: "{intent}"
+
+    이 항목을 장소에서 검색하려고 합니다.
+    음식이라면 음식 종류(예: 김치찌개 → 한식),
+    활동이라면 장소 유형(예: 책 읽기 → 북카페)으로 변환하세요.
+
+    결과는 반드시 JSON 배열로 출력하세요.
+    예: ["한식"]
+    """
+
+    response = _call_llm(llm_json, [{"role": "user", "content": prompt.strip()}])
+    keyword = item
+    if response is not None:
+        try:
+            keywords = _flatten(json.loads(response.content))
+            keyword = keywords[0] if keywords else item
+        except Exception:
+            print("[generate_keyword] 파싱 실패:")
+            print(traceback.format_exc())
+
+    return {**state, "search_keyword": keyword}
 
 def search_place(state:dict):
     '''카카오맵 API를 활용하여 search_keyword로 생성된 단어를 검색'''
@@ -180,7 +310,41 @@ def search_place(state:dict):
         
 def summarize_output(state:dict):
     print('summarize_output...')
+    """지금까지의 상태를 종합해서 사용자에게 보여줄 최종 안내 문구 생성."""
+    items = _flatten(state.get("recommend_items", ["추천 항목 없음"]))
+    item = items[0]
+
+    season = state.get("season", "봄")
+    weather = state.get("weather", "Clear")
+    timeslot = state.get("timeslot", "오후")
+    intent = state.get("intent", "food")
+    place = state.get("recommended_place", {})
+
+    name = place.get("name", "추천 장소")
+    address = place.get("address", "주소")
+    url = place.get("url", "")
+
+    prompt = f"""
+    사용자는 {intent}를 추천받으려고 합니다.
+    현재 계절은 {season}, 날씨는 {weather}, 시간대는 {timeslot}입니다.
+    추천 {intent} : {item},
+    추천 장소 : {name}({address})
+    추천 장소 사이트 {url}
+
+    이러한 정보를 바탕으로, 사용자에게 추천 장소를 안내하는
+    제안 문구를 적어보세요.
+    """
+
+    response = _call_llm(llm_normal, [
+        {"role": "user", "content": prompt},
+        {"role": "system", "content": "너는 사용자에게 친절하게 대하는 추천 챗봇이야."},
+    ])
+    final_message = response.content if response is not None else f"{name}({address}) 방문을 추천드려요!"
+
+    return {**state, "final_message": final_message}
 
 def handle_exception(state:dict):
     print('exception! ')
+    return {**state, "final_message": "저는 음식이나 활동 관련한 추천만 해 드릴 수 있습니다."}
+
 
